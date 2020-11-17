@@ -1,3 +1,21 @@
+# 50.6.0 - Month DD, YYYY
+
+## Added
+
+#### salesforcedx-vscode-soql
+
+- Show api error when running query ([PR #2733](https://github.com/forcedotcom/salesforcedx-vscode/pull/2733))
+
+## Fixed
+
+#### salesforcedx-vscode-soql
+
+- Parse uri for saved results as file ([PR #2732](https://github.com/forcedotcom/salesforcedx-vscode/pull/2732))
+
+- Jhork/publish soql ([PR #2727](https://github.com/forcedotcom/salesforcedx-vscode/pull/2727))
+
+- Prune and ignore files when packaging vsix ([PR #2695](https://github.com/forcedotcom/salesforcedx-vscode/pull/2695))
+
 # 50.5.0 - November 11, 2020
 
 ## Fixed
