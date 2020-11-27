@@ -26,8 +26,13 @@ import {
 
 export interface MockConnection {
   authInfo: object;
-  describeGlobal$: (callback: (err: Error | undefined, resp: any) => void) => void;
-  describe$: (name: string, callback: (err: Error | undefined, resp: any) => void) => void;
+  describeGlobal$: (
+    callback: (err: Error | undefined, resp: any) => void
+  ) => void;
+  describe$: (
+    name: string,
+    callback: (err: Error | undefined, resp: any) => void
+  ) => void;
   query: () => Promise<QueryResult<JsonMap>>;
 }
 
@@ -64,9 +69,81 @@ export const mockQueryData: QueryResult<JsonMap> = {
 };
 
 export const mockDescribeGlobalResponse = {
-  sobjects: [{ name: 'A' }, { name: 'B' }]
+  sobjects: [
+    { name: 'Account', queryable: true },
+    { name: 'User', queryable: true },
+    { name: 'Z', queryable: false }
+  ]
 };
-export const mockSObject = { name: 'A' };
+export const mockSObjects = [
+  {
+    name: 'Account',
+    fields: [
+      {
+        aggregatable: false,
+        name: 'Id',
+        label: 'Account ID',
+        custom: false,
+        groupable: true,
+        relationshipName: null,
+        sortable: true,
+        updateable: false
+      },
+      {
+        aggregatable: true,
+        custom: false,
+        filterable: true,
+        groupable: true,
+        label: 'Account Name',
+        name: 'Name',
+        nameField: true,
+        sortable: true,
+        type: 'string',
+        updateable: true
+      }
+    ]
+  },
+  {
+    name: 'User',
+    fields: [
+      {
+        aggregatable: true,
+        filterable: true,
+        groupable: true,
+        label: 'User ID',
+        name: 'Id',
+        referenceTo: [],
+        relationshipName: null,
+        sortable: true,
+        type: 'id'
+      },
+      {
+        aggregatable: true,
+        custom: false,
+        filterable: true,
+        groupable: true,
+        label: 'User Name',
+        name: 'Name',
+        nameField: true,
+        sortable: true,
+        type: 'string',
+        updateable: true
+      },
+      {
+        aggregatable: true,
+        filterable: true,
+        groupable: true,
+        label: 'Account ID',
+        name: 'AccountId',
+        referenceTo: ['Account'],
+        relationshipName: 'Account',
+        type: 'reference'
+      }
+    ]
+  }
+];
+export const mockSObject = mockSObjects[0];
+
 export function getMockConnection(
   sandbox: SinonSandbox,
   testUserName = 'test@test.com'
@@ -74,8 +151,18 @@ export function getMockConnection(
   const mockAuthInfo = { test: 'test' };
   const mockConnection = {
     authInfo: mockAuthInfo,
-    describeGlobal$: (callback: (err: Error | undefined, resp: any) => void) => callback(undefined, mockDescribeGlobalResponse),
-    describe$: (name: string, callback: (err: Error | undefined, resp: any) => void) => callback(undefined, mockSObject),
+    describeGlobal$: (callback: (err: Error | undefined, resp: any) => void) =>
+      callback(undefined, mockDescribeGlobalResponse),
+    describe$: (
+      name: string,
+      callback: (err: Error | undefined, resp: any) => void
+    ) => {
+      const sobjectMetadata = mockSObjects.find(s => s.name === name);
+      // if (!sobjectMetadata) {
+      //   throw new Error('Test failure! no mock sobject for name:' + name);
+      // }
+      callback(undefined, sobjectMetadata);
+    },
     query: () => Promise.resolve(mockQueryData)
   };
 
