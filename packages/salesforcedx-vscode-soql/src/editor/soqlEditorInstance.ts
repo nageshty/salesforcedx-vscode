@@ -170,13 +170,12 @@ export class SOQLEditorInstance {
         retrieveSObjects()
           .then(sobjectNames => this.updateSObjects(sobjectNames))
           .catch(e => {
-            if (e.errorCode !== 'NOT_FOUND') {
-              const errorMessage =
-                `An error occurred while handling a request for object names.\n` +
-                e.message;
-              vscode.window.showInformationMessage(errorMessage);
-              channelService.appendLine(errorMessage);
-            }
+            const errorMessage =
+              `An error occurred while handling a request for object names.\n` +
+              e.message;
+            vscode.window.showInformationMessage(errorMessage);
+            channelService.appendLine(errorMessage);
+
             this.updateSObjects([]);
           });
         break;
