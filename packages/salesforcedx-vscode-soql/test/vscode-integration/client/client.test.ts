@@ -6,11 +6,20 @@
  */
 
 import { expect } from 'chai';
+import { Connection } from '@salesforce/core';
 import * as path from 'path';
 import * as sinon from 'sinon';
 import { extensions, languages, Uri, window, workspace } from 'vscode';
 import { clearDiagnostics } from '../../../src/client/client';
 import { QueryRunner } from '../../../src/editor/queryRunner';
+import { getMockConnection, MockConnection } from '../testUtilities';
+import * as vscode from 'vscode';
+
+const sfdxCoreExtension = vscode.extensions.getExtension(
+  'salesforce.salesforcedx-vscode-core'
+);
+const sfdxCoreExports = sfdxCoreExtension?.exports;
+const { workspaceContext } = sfdxCoreExports;
 
 async function sleep(ms: number = 0) {
   return new Promise(resolve => {
@@ -21,8 +30,9 @@ async function sleep(ms: number = 0) {
 function waitUntil(predicate: () => boolean) {
   return new Promise(async resolve => {
     let notFound = true;
-    while (notFound) {
-      await sleep(0);
+    let tries = 5;
+    while (notFound || tries-- > 0) {
+      await sleep(50);
       notFound = !predicate();
     }
     resolve();
@@ -34,9 +44,12 @@ describe('SOQL language client', () => {
   let workspacePath: string;
   let soqlFileUri: Uri;
   const encoder = new TextEncoder();
+  let mockConnection: MockConnection;
 
   beforeEach(async () => {
     sandbox = sinon.createSandbox();
+    mockConnection = getMockConnection(sandbox);
+    sandbox.stub(workspaceContext, 'getConnection').returns(mockConnection);
     workspacePath = workspace.workspaceFolders![0].uri.fsPath;
     soqlFileUri = Uri.file(path.join(workspacePath, 'test.soql'));
     const ext = extensions.getExtension('salesforce.salesforcedx-vscode-soql')!;
@@ -75,14 +88,15 @@ describe('SOQL language client', () => {
       FROM Account
     `)
     );
-    sinon.stub(QueryRunner.prototype, 'runQuery').callsFake(async () => {
-      throw {
-        name: 'INVALID_FIELD',
-        errorCode: 'INVALID_FIELD',
-        message: expectedError
-      };
+
+    sandbox.stub(mockConnection, 'query').throws({
+      name: 'INVALID_FIELD',
+      errorCode: 'INVALID_FIELD',
+      message: expectedError
     });
 
+    // @ts-ignore
+    // const queryRunner = new QueryRunner(mockConnection);
     await window.showTextDocument(soqlFileUri);
 
     await waitUntil(() => {
