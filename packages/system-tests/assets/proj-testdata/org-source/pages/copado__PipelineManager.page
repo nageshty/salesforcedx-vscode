@@ -1,0 +1,1048 @@
+<apex:page id="PipelineManager" standardController="copado__Deployment_Flow__c" extensions="copado.PipelineManagerExtension" lightningStylesheets="true" sideBar="false" docType="html-5.0" title="Pipeline Manager" showHeader="true">
+    <apex:slds />
+    <c:GAnalytics />
+    <script>
+        ga('send', 'pageview', {
+          'page': '/PipelineManager',
+          'title': 'Pipeline Manager'
+        });
+    </script>
+    <c:IncludeConnectionJsComponent />
+    <apex:includeScript value="{!URLFOR($Resource.utils) }" />
+    <c:IncludeStaticsResourceComponent addJQuery="true" addUIjs="true" addUIcss="true" addCometdjs="true" addJCometdjs="true" addJSON2js="true" addJSzipjs="true" />
+    <link rel="stylesheet" type="text/css" href="{!URLFOR($Resource.DataTables10,'DataTables10/datatables.min.css')}" />
+    <apex:includeScript value="{!URLFOR($Resource.JsRemoting) }" />
+    <script type="text/javascript" src="{!URLFOR($Resource.PipelineJS) }"></script>
+    <c:IncludeJqxResourceComponent addjqxalljs="true" addjqxWjs="true" addjqxBasecss="true" />
+    <apex:includeScript value="{!URLFOR($Resource.pipelineStreamingService) }" />
+    <apex:includeScript value="{!URLFOR($Resource.UserStoryStreamingService) }" />
+    <link rel="stylesheet" href="{!URLFOR($Resource.CopadoChangeManagement,'Assets/css/deploymentFlowConnections.css')}" />
+    <link rel="stylesheet" href="{!URLFOR($Resource.PipelineCSS)}" />
+    <script>
+        // TODO: Refactor this script
+        var copadoApp = {
+            ns: '{!JSENCODE(namespace)}',
+            data: {
+                flowId: '{!JSENCODE(Deployment_Flow__c.Id)}',
+                isClassic : "{!IF(CONTAINS($User.UIThemeDisplayed, 'Theme4'), false, true)}"
+            },
+            envConnections: [],
+            icons:{
+                success: '{!URLFOR($Resource.SetupDashboardIcons, "PipelineSvgIcons/pipeline-check.png")}',
+                failed: '{!URLFOR($Resource.SetupDashboardIcons, "PipelineSvgIcons/pipeline-cross.png")}',
+                paused: '{!URLFOR($Resource.SetupDashboardIcons, "PipelineSvgIcons/pipeline-paused.png")}',
+                conflict: '{!URLFOR($Resource.SetupDashboardIcons, "PipelineSvgIcons/pipeline-warning.png")}'
+            }
+        };
+        var openWarningModal = () => {
+            $copado('#deploymentFlowActivationModal').addClass('slds-fade-in-open');
+            $copado('#backdropActivationModal').addClass('slds-backdrop--open');
+            unlockScreen();
+            return false;
+        };
+        function togglePipelineMode() {
+            lockScreen();
+            if ('{!JSENCODE(pipelineMode)}' === '{!JSENCODE(MANAGER)}') {
+                changePipelineMode();
+            } else if ({!NOT(CheckPipelineStepsAuthenticated) }) {
+                addWarningToPage("{!JSENCODE($Label.Pipeline_Activate_Pipeline_Prompt)}");
+                unlockScreen();
+            } else if ({!NOT(currentPipeline.Active__c) }) {
+                openWarningModal();
+                return false;
+            } else {
+                changePipelineMode();
+            }
+        };
+        var defineVariables = () => {
+            ccd.config.ns = copadoApp.ns;
+            ccd.config.mode = '{!JSENCODE(pipelineMode)}';
+            ccd.config.currentUserId = '{!$User.Id}';
+        };
+        $copado(document).ready(() => {
+            lockScreen();
+            if('{!currentPipeline.Id}') {
+                calculateFlowSteps();
+            }
+            defineVariables();
+            try {
+                if({!currentPipeline.Active__c}) {
+                    var streamingSettingsMap = JSON.parse('{!JSENCODE(streamingSettingsJSON)}');
+                    var environmentStreamSettings = streamingSettingsMap[ccdStream.config.pushTopicName];
+                    if(environmentStreamSettings && environmentStreamSettings[copadoApp.ns + 'Enabled__c']) {
+                        console.info('Pipeline streaming is enabled.');
+                        ccdStream.statusMap = {
+                            'Completed Successfully' : copadoApp.icons.success,
+                            'Completed with Errors' : copadoApp.icons.failed,
+                            'Paused' : copadoApp.icons.paused,
+                            'Outdated' : copadoApp.icons.warning
+                        };
+                        if(environmentStreamSettings[copadoApp.ns + 'Timeout__c']) {
+                            ccdStream.config.duration = ccdStream.config.timeout = environmentStreamSettings[copadoApp.ns + 'Timeout__c'];
+                        }
+                        ccdStream.config.ns = copadoApp.ns;
+                        ccdStream.config.sobjectAccessError = '{!JSENCODE($Label.SObject_Access_Error)}';
+                        ccdStream.initStreaming();
+                    }
+                    var storyStreamSettings = streamingSettingsMap[ccdStoryStream.config.pushTopicName];
+                    if(storyStreamSettings && storyStreamSettings[copadoApp.ns + 'Enabled__c']) {
+                        console.info('User Story streaming is enabled.');
+                        if(storyStreamSettings[copadoApp.ns + 'Timeout__c']) {
+                            ccdStoryStream.config.duration = ccdStoryStream.config.timeout = storyStreamSettings[copadoApp.ns + 'Timeout__c'];
+                        }
+                        ccdStoryStream.config.ns = copadoApp.ns;
+                        ccdStoryStream.config.sobjectAccessError = '{!JSENCODE($Label.SObject_Access_Error)}';
+                        updateStoryStreamVariables();
+                        ccdStoryStream.initStreaming();
+                    }
+                    window.onbeforeunload = ccdStream ? ccdStream.disconnect : ccdStoryStream ? ccdStoryStream.disconnect : '';
+                }
+            } catch(err) {
+                console.error(err);
+            }
+        });
+        function doOauth(stepId, envId, envName, branch) {
+            doAuthentication(stepId, envId, envName, branch, 'false', 'false');
+            return false;
+        }
+        function getUserStoryListForPromotion(envId, toEnvId, action) {
+            prepareUserStoriesForPromotion(envId, toEnvId, action);
+            return false;
+        }
+        function closeWarningModal() {
+            $copado('#deploymentFlowActivationModal').removeClass('slds-fade-in-open');
+            $copado('#backdropActivationModal').removeClass('slds-backdrop--open');
+            return false;
+        }
+        function callHeaderMode() {
+            return '{!JSENCODE(pipelineMode)}';
+        }
+
+    </script>
+    <div class="slds-scope">
+        <apex:form id="filterModalForm">
+            <apex:actionFunction name="addFilterConditionEntry" action="{!addFilterConditionEntry}" reRender="userStoryFilterSection,addRowButtonContainer,pageMsgs" status="loadingScreen" />
+            <apex:actionFunction name="removeFilterConditionEntry" action="{!removeFilterConditionEntry}" reRender="userStoryFilterSection,addRowButtonContainer,pageMsgs" status="loadingScreen" immediate="true">
+                <apex:param value="" name="selectedIndex" assignTo="{!selectedConditionIndex}" />
+            </apex:actionFunction>
+            <apex:actionFunction name="deleteSelectedFilter" action="{!deleteSelectedFilter}"
+                                 reRender="filterModalForm,filterManagerPanel,flowStepPanel,calculatedStepsPanel,pageMsgs" status="loadingScreen" onComplete="repositionBoxes();ccd.reRenderFunction();" />
+            <apex:actionFunction name="createFromExistingFilter" action="{!createFromExistingFilter}" onComplete="saveFilter();"
+                                 reRender="JSModalCodePanel,filterConditionSection,nameInput,pageMsgs" />
+            <apex:actionFunction name="saveFilter" action="{!saveFilter}" reRender="flowStepPanel,pageMsgs"
+                                 onComplete="assignAndApplySelectedFilter({!filterSaveError || popupHasMessages});" />
+            <apex:actionFunction name="applySelectedFilter" action="{!applySelectedFilter}" onComplete="showFilterModal(false); updatePageGraphics();" status="loadingScreen"
+                                 reRender="editViewHeader,environmentMultiselectPanel,userStoryFilterSection,footerButtonSection,confirmDeleteHeader,flowStepPanel,calculatedStepsPanel,copadoErrorPanel,pageMsgs" />
+            <div class="slds-grid" id="filterModalDiv" style="display: none;">
+                <apex:outputPanel layout="block" id="filterConditionSection">
+                    <apex:inputField styleClass="shareWithInput" value="{!selectedFilter.thisFilter.copado__Share_With__c}" style="display: none;" />
+                    <apex:inputText value="{!selectedConditionIndex}" styleClass="selectedConditionIndex" style="display: none;" />
+                    <section role="dialog" tabindex="-1" aria-modal="true" class="slds-modal slds-fade-in-open slds-modal_medium">
+                        <div class="slds-modal__container">
+                            <div class="slds-modal__header">
+                                <span class="slds-modal__close">
+                                    <img src="{!URLFOR($Resource.SLDS, '/assets/icons/utility/close_60.png')}" onclick="showFilterModal(false);" />
+                                </span>
+                                <apex:outputPanel id="editViewHeader">
+                                    <h2 class="slds-text-heading_medium slds-hyphenate">
+                                        <b>{!IF(selectedFilter.thisFilter.Id == null, $Label.copado__create_new_view, $Label.copado__edit_view + ': ' + selectedFilter.thisFilter.Name)}</b>
+                                    </h2>
+                                </apex:outputPanel>
+                            </div>
+                            <div class="slds-modal__content slds-p-around_medium">
+                                <apex:pageMessages id="pageMsgs" />
+                                <div class="slds-p-bottom_small slds-border_bottom">
+                                    <div class="slds-grid slds-p-bottom_small">
+                                        <div class="slds-col slds-size_1-of-3">
+                                            <div class="slds-form-element slds-size_1-of-2">
+                                                <label class="slds-form-element__label" for="nameInput">
+                                                    <b>{!$ObjectType.copado__Filter__c.fields.Name.Label}</b>
+                                                    <abbr class="slds-required" title="required"> *</abbr>
+                                                </label>
+                                                <div class="slds-form-element__control">
+                                                    <apex:inputField styleClass="slds-input" id="nameInput" value="{!selectedFilter.thisFilter.Name}" />
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="slds-col slds-size_1-of-3">
+                                            <fieldset class="slds-form-element">
+                                                <legend class="slds-form-element__legend slds-form-element__label">
+                                                    {!$Label.copado__who_can_see_this_filter}
+                                                    <abbr class="slds-required" title="required"> *</abbr>
+                                                </legend>
+                                                <div class="slds-form-element__control">
+                                                    <span class="slds-radio">
+                                                        <apex:outputPanel layout="none" rendered="{!IF(selectedFilter.thisFilter.Id == null || selectedFilter.thisFilter.copado__Share_With__c == 'Me', '', 'none')}">
+                                                            <input type="radio" id="onlyMe" value="Me" name="sharingOption" onclick="setSharingMode(this.value);" checked="checked" />
+                                                        </apex:outputPanel>
+                                                        <apex:outputPanel layout="none" rendered="{!IF(selectedFilter.thisFilter.Id != null && selectedFilter.thisFilter.copado__Share_With__c != 'Me', '', 'none')}">
+                                                            <input type="radio" id="onlyMe" value="Me" name="sharingOption" onclick="setSharingMode(this.value);" />
+                                                        </apex:outputPanel>
+                                                        <label class="slds-radio__label" for="onlyMe">
+                                                            <span class="slds-radio_faux"></span>
+                                                            <span class="slds-form-element__label">{!$Label.Only_Me}</span>
+                                                        </label>
+                                                    </span>
+                                                    <span class="slds-radio">
+                                                        <apex:outputPanel layout="none" rendered="{!IF(selectedFilter.thisFilter.Id != null && selectedFilter.thisFilter.copado__Share_With__c == 'All', '', 'none')}">
+                                                            <input type="radio" id="allUsers" value="All" name="sharingOption" onclick="setSharingMode(this.value);" checked="checked" />
+                                                        </apex:outputPanel>
+                                                        <apex:outputPanel layout="none" rendered="{!IF(selectedFilter.thisFilter.Id == null || selectedFilter.thisFilter.copado__Share_With__c != 'All', '', 'none')}">
+                                                            <input type="radio" id="allUsers" value="All" name="sharingOption" onclick="setSharingMode(this.value);" />
+                                                        </apex:outputPanel>
+                                                        <label class="slds-radio__label" for="allUsers">
+                                                            <span class="slds-radio_faux"></span>
+                                                            <span class="slds-form-element__label">{!$Label.All_Users}</span>
+                                                        </label>
+                                                    </span>
+                                                </div>
+                                            </fieldset>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="slds-p-top_medium">
+                                    <div class="slds-p-bottom_medium slds-border_bottom">
+                                        <div class="slds-p-bottom_small slds-text-heading_small">
+                                            {!$Label.Environment_Filters}
+                                        </div>
+                                        <div class="slds-grid">
+                                            <apex:outputPanel layout="block" id="environmentMultiselectPanel" styleClass="slds-col slds-size_8-of-12">
+                                                <c:MultiselectPicklist leftLabel="{!$Label.copado__visible_environments}" rightLabel="{!$Label.copado__hidden_environments}"
+                                                                       pleftOptions="{!environmentOptions}" prightOptions="{!environmentsToHide}"
+                                                                       size="{!environmentOptions.size}" width="100%" showSortArrows="false" />
+                                            </apex:outputPanel>
+                                        </div>
+                                    </div>
+                                    <div class="slds-p-top_small">
+                                        <div class="slds-p-bottom_small slds-text-heading_small">
+                                            {!$Label.copado__user_story_filters}
+                                        </div>
+                                        <apex:outputPanel layout="block" id="userStoryFilterSection">
+                                            <ol>
+                                                <apex:actionFunction name="updateInputType" action="{!updateInputType}" reRender="none" onComplete="reRenderInput();" />
+                                                <apex:actionFunction name="reRenderInput" reRender="userStoryFilterSection,pageMsgs" onComplete="unlockScreen();" />
+                                                <apex:variable var="index" value="{!0}" />
+                                                <apex:repeat value="{!selectedFilter.filterConditions}" var="condition">
+                                                    <li>
+                                                        <div class="slds-grid slds-p-top_medium slds-p-bottom_medium slds-border_bottom">
+                                                            <div class="slds-col slds-size_2-of-12 slds-p-right_small">
+                                                                <div class="slds-form-element">
+                                                                    <div class="slds-form-element__control">
+                                                                        <div class="slds-select_container">
+                                                                            <apex:selectList multiSelect="false" size="1" value="{!condition.fieldApiName}"
+                                                                                             styleClass="slds-select" disabled="{!fieldOptions.size == 0}"
+                                                                                             onChange="lockScreen(); updateSelectedFieldType({!index});">
+                                                                                <apex:selectOptions value="{!fieldOptions}" />
+                                                                            </apex:selectList>
+                                                                        </div>
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                            <div class="slds-col slds-size_2-of-12 slds-p-right_small">
+                                                                <div class="slds-form-element">
+                                                                    <div class="slds-form-element__control">
+                                                                        <div class="slds-select_container">
+                                                                            <apex:selectList multiSelect="false" size="1" value="{!condition.operator}" styleClass="slds-select">
+                                                                                <apex:selectOptions value="{!condition.operatorOptions}" />
+                                                                            </apex:selectList>
+                                                                        </div>
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                            <div class="slds-col slds-p-right_small">
+                                                                <div class="slds-form-element {!IF(condition.fieldType == 'BOOLEAN', 'checkbox', '')}"
+                                                                     style="{!IF(condition.fieldType != 'MULTIPICKLIST' && !condition.isReadOnly, 'width: 44%;', '')}">
+                                                                    <apex:repeat value="{!fieldOptions}" var="filterOption">
+                                                                        <apex:outputPanel layout="block" styleClass="slds-form-element__control" rendered="{!condition.fieldApiName == filterOption.value}">
+                                                                            <apex:outputPanel layout="none" rendered="{!condition.fieldApiName != ''}">
+                                                                                <apex:inputField styleClass="{!IF(condition.fieldType != 'BOOLEAN', 'slds-input', 'slds-checkbox')}" rendered="{!!condition.isReadOnly}"
+                                                                                                 type="{!IF(condition.fieldType == 'INTEGER' || condition.fieldType == 'DOUBLE' || condition.fieldType == 'LONG', 'number', '')}"
+                                                                                                 value="{!selectedFilter.userStoryFilter[condition.fieldApiName]}" required="false"
+                                                                                                 showDatePicker="{!IF(condition.fieldType == 'DATE' || condition.fieldType == 'DATETIME', 'true', 'false')}"
+                                                                                                 onKeyUp="if({!condition.fieldType == 'INTEGER' || condition.fieldType == 'DOUBLE' || condition.fieldType == 'LONG'}) preventNonNumericInput(this)"
+                                                                                                 html-onpaste="if({!condition.fieldType == 'INTEGER' || condition.fieldType == 'DOUBLE' || condition.fieldType == 'LONG'}) preventNonNumericInput(this)" />
+                                                                                <apex:outputPanel layout="block" rendered="{!condition.isReadOnly}" style="{!IF(condition.fieldType == 'DATETIME', 'width: 60%;', 'width: 44%;')}">
+                                                                                    <c:LightningReadyInputFields sObject="{!selectedFilter.readOnlyFields[condition.fieldApiName]}" field="{!condition.auxiliaryField}" showLabel="false" />
+                                                                                </apex:outputPanel>
+                                                                            </apex:outputPanel>
+                                                                            <apex:outputPanel rendered="{!condition.fieldApiName == ''}">
+                                                                                <input type="text" class="slds-input" readonly="true" disabled="disabled" />
+                                                                            </apex:outputPanel>
+                                                                        </apex:outputPanel>
+                                                                    </apex:repeat>
+                                                                </div>
+                                                            </div>
+                                                            <div class="slds-col slds-size_1-of-12 {!IF(condition.fieldType != 'MULTIPICKLIST', 'slds-align-middle', '')}">
+                                                                <apex:outputPanel layout="block" id="deleteButtonPanel" styleClass="deleteIcon">
+                                                                    <img src="{!URLFOR($Resource.SLDS, '/assets/icons/utility/delete_60.png')}" onclick="removeFilterConditionEntry({!index});" />
+                                                                </apex:outputPanel>
+                                                            </div>
+                                                        </div>
+                                                    </li>
+                                                    <apex:variable var="index" value="{!index + 1}" />
+                                                </apex:repeat>
+                                            </ol>
+                                        </apex:outputPanel>
+                                        <apex:outputPanel layout="block" id="addRowButtonContainer" styleClass="slds-grid slds-p-top_small">
+                                            <apex:outputPanel layout="block" styleClass="slds-col slds-size_2-of-12" rendered="{!selectedFilter.filterConditions.size < CONDITION_ENTRY_LIMIT}">
+                                                <div class="slds-form-element">
+                                                    <div class="slds-form-element__control">
+                                                        <input type="button" class="slds-button slds-button_neutral" value="{!$Label.ADD_ROW}" onclick="addFilterConditionEntry();" />
+                                                    </div>
+                                                </div>
+                                            </apex:outputPanel>
+                                            <apex:outputPanel layout="block" styleClass="slds-col" rendered="{!selectedFilter.filterConditions.size >= CONDITION_ENTRY_LIMIT}">
+                                                <div class="slds-text-heading_small">
+                                                    {!SUBSTITUTE($Label.copado__filter_condition_limit_reached, '##LIMIT##', TEXT(CONDITION_ENTRY_LIMIT))}
+                                                </div>
+                                            </apex:outputPanel>
+                                        </apex:outputPanel>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="slds-modal__footer">
+                                <apex:outputPanel layout="block" id="footerButtonSection" styleClass="slds-grid {!IF(selectedFilter.thisFilter.Id == null, 'slds-grid_align-end', '')}">
+                                    <div class="slds-col slds-size_1-of-12 slds-col_bump-right" style="display: {!IF(selectedFilter.thisFilter.Id != null, '', 'none')};">
+                                        <input type="button" class="slds-button slds-button_destructive" value="{!$Label.DELETE}" onclick="showConfirmFilterDeletion(true);" />
+                                    </div>
+                                    <div class="slds-col slds-size_1-of-10">
+                                        <input type="button" class="slds-button slds-button_outline-brand" value="{!$Label.Cancel}" onclick="showFilterModal(false);" />
+                                    </div>
+                                    <div class="slds-col slds-size_1-of-10 slds-m-left_small slds-text-align_center {!IF(selectedFilter.thisFilter.Id != null, 'criteriaPanelButton', '')}"
+                                         style="display: {!IF(selectedFilter.thisFilter.Id != null, '', 'none')};">
+                                        <input type="button" class="slds-button slds-button_outline-brand" value="{!$Label.Save_as_New}" onclick="lockScreen(); createFromExistingFilter();" />
+                                    </div>
+                                    <div class="slds-col slds-size_1-of-10 slds-m-left_small">
+                                        <input type="button" class="slds-button slds-button_brand" value="{!$Label.Save}" onclick="lockScreen(); saveFilter();" />
+                                    </div>
+                                </apex:outputPanel>
+                            </div>
+                        </div>
+                    </section>
+                </apex:outputPanel>
+                <div class="slds-backdrop slds-backdrop_open"></div>
+            </div>
+            <span id="confirmDeletePopup" style="display: none;">
+                <section role="dialog" tabindex="-1" aria-modal="true" class="slds-modal slds-fade-in-open">
+                    <div class="slds-modal__container">
+                        <apex:outputPanel layout="block" id="confirmDeleteHeader" styleClass="slds-modal__header slds-border_top slds-border_left slds-border_right">
+                            <span class="slds-modal__close">
+                                <img src="{!URLFOR($Resource.SLDS, '/assets/icons/utility/close_60.png')}" onclick="showConfirmFilterDeletion(false);" />
+                            </span>
+                            <h2 class="slds-text-heading_small slds-hyphenate">
+                                {!$Label.DELETE + ' ' + selectedFilter.thisFilter.Name}?
+                            </h2>
+                        </apex:outputPanel>
+                        <div class="slds-modal__content slds-border_bottom slds-border_left slds-border_right">
+                            <div class="slds-grid slds-grid_align-center slds-p-vertical_small">
+                                <div class="slds-col slds-p-right_small">
+                                    <input type="button" class="slds-button slds-button_brand" value="{!$Label.NO}" onclick="showConfirmFilterDeletion(false);" />
+                                </div>
+                                <div class="slds-col">
+                                    <input type="button" class="slds-button slds-button_outline-brand" value="{!$Label.YES}" onclick="showConfirmFilterDeletion(false); deleteSelectedFilter();" />
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+                <div class="slds-backdrop slds-backdrop_open"></div>
+            </span>
+            <apex:outputPanel id="JSModalCodePanel">
+                <script>
+                    function updateSelectedFieldType(index) {
+                        setSelectedIndex(index);
+                        updateInputType();
+                    }
+                    function setSelectedIndex(index) {
+                        var selectedConditionIndex = document.querySelector('.selectedConditionIndex');
+                        if(selectedConditionIndex) {
+                            selectedConditionIndex.value = index;
+                        }
+                    }
+                    function assignAndApplySelectedFilter(error) {
+                        if(error) {
+                            ccd.reRenderFunction();
+                            unlockScreen();
+                        } else {
+                            applySelectedFilter();
+                        }
+                    }
+                    function showConfirmFilterDeletion(show) {
+                        var confirmDeletePopup = document.getElementById('confirmDeletePopup');
+                        if(confirmDeletePopup) {
+                            confirmDeletePopup.style.display = show ? 'block' : 'none';
+                        }
+                    }
+                    function showFilterModal(show) {
+                        var filterModalDiv = document.getElementById('filterModalDiv');
+                        if(filterModalDiv) {
+                            filterModalDiv.style.display = show ? 'block' : 'none';
+                        }
+                    }
+                    function setSharingMode(sharingMode) {
+                        var shareWithInput = document.querySelector('.shareWithInput');
+                        if(shareWithInput) {
+                            shareWithInput.value = sharingMode;
+                        }
+                    }
+                    function updatePageGraphics() {
+                        repositionBoxes();
+                        ccd.reRenderFunction();
+                        updateStoryStreamVariables();
+                    }
+                    function preventNonNumericInput(thisInput) {
+                        thisInput.value = thisInput.value.replace('[^0-9]','');
+                    }
+
+                </script>
+            </apex:outputPanel>
+        </apex:form>
+        <apex:form id="pipelineForm">
+            <apex:actionFunction name="changePipelineMode" action="{!changePipelineMode}" reRender="pipelineWrapper" onComplete="ccd.reRenderFunction();" />
+            <apex:actionFunction name="assingProId" onComplete="ccd.fromAcf2Open();" action="{!assignCurrentPro}" reRender="dependencyUSComponent">
+                <apex:param name="currentProId" value="" />
+            </apex:actionFunction>
+            <apex:actionFunction name="renderPageMessage" reRender="notify" />
+            <apex:actionFunction action="{!recalculate}" name="refreshPipeline" reRender="pipelineWrapper" onComplete="ccd.reRenderFunction();" />
+            <apex:actionFunction name="reRenderPipelineWrapper" reRender="filterModalForm, pipelineWrapper" onComplete="ccd.reRenderFunction();" />
+            <apex:actionFunction name="closeToastMessage" action="{!closeToastMessage}" reRender="notify" />
+            <apex:actionFunction action="{!populateFlowGridMap}" name="calculateFlowSteps" onComplete="repositionBoxes();ccd.isManagerRunning('{!JSINHTMLENCODE(pipelineMode)}');updateStoryStreamVariables();" reRender="calculatedStepsPanel,notify" />
+            <apex:actionFunction name="prepareUserStoriesForPromotion" action="{!getPromotableBackPromotableUserStoriesList}" reRender="operationModal,notify" onComplete="showModal();switchToUserStory();">
+                <apex:param name="fromId" value="" />
+                <apex:param name="toId" value="" />
+                <apex:param name="pathType" value="" />
+            </apex:actionFunction>
+            <apex:actionFunction name="promotableUserStories" action="{!getPromotableUserStoriesCount}" onComplete="backPromotableUserStories();" reRender="noRender" />
+            <apex:actionFunction name="backPromotableUserStories" action="{!getBackPromotableUserStoriesCount}" onComplete="ccd.reRenderFunction();" reRender="filterModalForm,pipelineWrapper" />
+            <apex:actionFunction name="createOrgCredentials" action="{!createOrgCredential}" reRender="canvasSvg">
+                <apex:param value="" name="flowStepId" />
+                <apex:param value="" name="envId" />
+                <apex:param value="" name="envName" />
+                <apex:param value="" name="branch" />
+                <apex:param value="" name="newOrg" />
+                <apex:param value="" name="useStep" />
+            </apex:actionFunction>
+            <apex:actionFunction name="doAuthentication" action="{!authenticateEnvironment}" status="loadingScreen" reRender="rerenderNeeded">
+                <apex:param value="" name="flowStepId" />
+                <apex:param value="" name="envId" />
+                <apex:param value="" name="envName" />
+                <apex:param value="" name="branch" />
+                <apex:param value="" name="newOrg" />
+                <apex:param value="" name="useStep" />
+            </apex:actionFunction>
+            <apex:actionFunction name="updatePipelinePanel" action="{!updatePipeline}" onComplete="updatePageGraphics();" reRender="pipelineWrapper,calculatedStepsPanel" status="loadingScreen" />
+            <apex:actionFunction name="addWarningToPage" action="{!addMessageToPage}" reRender="copadoErrorPanel">
+                <apex:param value="" name="warningMessage" />
+            </apex:actionFunction>
+            <apex:actionFunction name="createNewConnectionBehaviorAndBind" action="{!createConnectionBehavior}" reRender="copadoErrorPanel">
+                <apex:param value="" name="pipelineStepId" />
+                <apex:param value="" name="environmentId" />
+                <apex:param value="" name="sourceName" />
+                <apex:param value="" name="destinationName" />
+            </apex:actionFunction>
+            <apex:outputPanel layout="block" id="pipelineWrapper">
+                <apex:outputPanel layout="block" id="flowStepPanel" styleClass="slds-scrollable_x">
+                    <div class="co-pipeline-container {!IF(CONTAINS($User.UIThemeDisplayed, 'Theme4'), '', 'classic-container')}">
+                        <c:CopadoSpinner />
+                        <apex:outputPanel id="copadoErrorPanel" layout="none">
+                            <c:CopadoErrorPanel pageMessagesMap="{!pageMessagesMap}" />
+                        </apex:outputPanel>
+                        <!--  Header  -->
+                        <div class="slds-page-header slds-page-header_record-home" id="headerPanel">
+                            <!-- Message Modals -->
+                            <div>
+                                <section role="dialog" id="deploymentFlowActivationModal" tabindex="-1" aria-labelledby="modal-heading-01" aria-modal="true" aria-describedby="modal-content-id-1" class="slds-modal slds-modal_small">
+                                    <div class="slds-modal__container">
+                                        <header class="slds-modal__header">
+                                            <button class="slds-button slds-button_icon slds-modal__close slds-button_icon-inverse" title="Close" onClick="closeWarningModal(); return false;">
+                                                <svg class="slds-button__icon slds-button__icon_large" aria-hidden="true">
+                                                    <use xmlns:xlink="http://www.w3.org/1999/xlink" xlink:href="{!URLFOR($Asset.SLDS, '/assets/icons/utility-sprite/svg/symbols.svg#close')}" />
+                                                </svg>
+                                                <span class="slds-assistive-text">{!$Label.CLOSE}</span>
+                                            </button>
+                                            <h2 id="modal-heading-01" class="slds-text-heading_medium slds-hyphenate">{!$Label.WARNING}</h2>
+                                        </header>
+                                        <div class="slds-modal__content slds-p-around_medium" id="modal-content-id-1" style="text-align: center">
+                                            <apex:outputPanel layout="block" id="errorMessages">
+                                                <div class="pageLevelErrors" tabindex="-1" style="display: none">
+                                                    <div class="desktop forcePageError" aria-live="assertive">
+                                                        <div class="genericNotification">
+                                                            <span class="genericError uiOutputText">
+                                                                {!$Label.Pipeline_Review_Errors}
+                                                            </span>
+                                                        </div>
+                                                        <ul class="errorsList">
+                                                            <li>
+                                                                <apex:pageMessage severity="error" title="ERROR: " strength="3" summary="{!errorMessage}" id="theErrorMessage" rendered="{!NOT(ISNULL(errorMessage))}" />
+                                                            </li>
+                                                        </ul>
+                                                    </div>
+                                                </div>
+                                            </apex:outputPanel>
+                                            <div class="slds-illustration slds-illustration_small">
+                                                <svg class="slds-illustration__svg" viewBox="0 0 454 234" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+                                                    <g stroke="none" stroke-width="1" fill="none" fill-rule="evenodd">
+                                                        <g transform="translate(2.000000, 2.000000)">
+                                                            <g transform="translate(52.500000, 147.000000)">
+                                                                <path vector-effect="non-scaling-stroke" d="M18.9209988,1.95433401 L33.259296,51.443436 C33.5666778,52.5043744 32.9557995,53.613617 31.8948612,53.9209988 C31.7139843,53.9734036 31.5266126,54 31.3382972,54 L2.6617028,54 C1.5571333,54 0.661702805,53.1045695 0.661702805,52 C0.661702805,51.8116846 0.688299176,51.6243129 0.74070397,51.443436 L15.0790012,1.95433401 C15.386383,0.893395645 16.4956256,0.282517358 17.556564,0.589899164 C18.2152102,0.780726338 18.7301717,1.29568777 18.9209988,1.95433401 Z"
+                                                                      fill="#FFFFFF" fill-rule="nonzero"></path>
+                                                                <g stroke-linecap="round" class="slds-illustration__stroke-secondary" stroke-width="3">
+                                                                    <polygon vector-effect="non-scaling-stroke" stroke-linejoin="round" points="17 0.324 34 54 0 54"></polygon>
+                                                                    <path vector-effect="non-scaling-stroke" d="M17,4.6953125 C17,43.0456294 17,62.6471919 17,63.5 C17,62.6471919 17,43.0456294 17,4.6953125 Z"></path>
+                                                                    <path vector-effect="non-scaling-stroke" d="M17,29.3239437 C22.3333333,35.7851611 25,39.1184944 25,39.3239437 C25,39.1184944 22.3333333,35.7851611 17,29.3239437 Z" stroke-linejoin="round" transform="translate(21.000000, 34.323944) scale(-1, 1) translate(-21.000000, -34.323944) "></path>
+                                                                </g>
+                                                            </g>
+                                                            <g transform="translate(73.000000, 119.000000)">
+                                                                <path vector-effect="non-scaling-stroke" d="M26.6478873,0 L51.879042,84.4273253 C52.1953215,85.4856452 51.5937789,86.5999782 50.535459,86.9162577 C50.3496374,86.9717906 50.1567264,87 49.9627843,87 L3.33299037,87 C2.22842087,87 1.33299037,86.1045695 1.33299037,85 C1.33299037,84.8060578 1.36119976,84.6131469 1.41673264,84.4273253 L26.6478873,0 Z"
+                                                                      fill="#FFFFFF" fill-rule="nonzero"></path>
+                                                                <g stroke-linecap="round" class="slds-illustration__stroke-secondary" stroke-width="3">
+                                                                    <polygon vector-effect="non-scaling-stroke" stroke-linejoin="round" points="26.5 0 52.5 87 0.5 87"></polygon>
+                                                                    <path vector-effect="non-scaling-stroke" d="M26.5,2.58642578 C26.5,61.0261034 26.5,90.9972948 26.5,92.5 C26.5,90.9972948 26.5,61.0261034 26.5,2.58642578 Z"></path>
+                                                                    <path vector-effect="non-scaling-stroke" d="M15.6478873,42 C22.314554,49.078692 25.6478873,52.7453587 25.6478873,53 C25.6478873,52.7453587 22.314554,49.078692 15.6478873,42 Z M27.6478873,68 C36.9812207,57.078692 41.6478873,51.7453587 41.6478873,52 C41.6478873,51.7453587 36.9812207,57.078692 27.6478873,68 Z"
+                                                                          stroke-linejoin="round"></path>
+                                                                </g>
+                                                            </g>
+                                                            <g stroke-linecap="round" stroke-linejoin="round" transform="translate(332.500000, 170.000000) scale(-1, 1) translate(-332.500000, -170.000000) translate(276.000000, 151.000000)" class="slds-illustration__stroke-secondary" stroke-width="3">
+                                                                <polyline vector-effect="non-scaling-stroke" points="0 38 47.5 0 80.5 26"></polyline>
+                                                                <polyline vector-effect="non-scaling-stroke" points="71 17 80.5 9 113 36"></polyline>
+                                                            </g>
+                                                            <g transform="translate(0.000000, 187.500000)">
+                                                                <path vector-effect="non-scaling-stroke" d="M153.962142,26.4644491 C151.225735,20.0143094 144.944776,15.5029106 137.633892,15.5029106 C135.619663,15.5029106 133.683612,15.8453541 131.878328,16.4764392 C128.451481,11.1704266 122.567406,7.66985447 115.883789,7.66985447 C109.491267,7.66985447 103.830159,10.8721423 100.350851,15.7935668 C98.9589956,14.968161 97.3423157,14.4956341 95.6177606,14.4956341 C94.1083143,14.4956341 92.6815102,14.8576334 91.4157672,15.5014039 C87.9975328,6.58722215 79.5098304,0.275259875 69.5804557,0.275259875 C60.4632836,0.275259875 52.5615782,5.59684366 48.6837305,13.3681823 C46.3912034,12.266973 43.8314865,11.6515593 41.1312741,11.6515593 C32.4373504,11.6515593 25.1998844,18.0312998 23.6476214,26.4644491 L153.962142,26.4644491 Z"
+                                                                      class="slds-illustration__fill-secondary" fill-rule="nonzero"></path>
+                                                                <path vector-effect="non-scaling-stroke" d="M13,25 L143,25 M0,25 L450,25" class="slds-illustration__stroke-secondary" stroke-width="3" stroke-linecap="round"></path>
+                                                            </g>
+                                                            <g transform="translate(272.293000, 172.055000)">
+                                                                <path vector-effect="non-scaling-stroke" d="M165.428708,41.9454545 L0.0995432562,41.9454545 C0.0336614956,41.2089487 0,40.4630069 0,39.7090909 C0,26.2132599 10.7866531,15.2727273 24.0926641,15.2727273 C27.7492016,15.2727273 31.215485,16.0989227 34.3199502,17.5772977 C39.5712028,7.14424616 50.271428,0 62.6175975,0 C76.0636257,0 87.5573893,8.47383452 92.1862485,20.441159 C93.9002755,19.5768947 95.8324059,19.0909091 97.8764479,19.0909091 C100.211783,19.0909091 102.401037,19.7252784 104.285841,20.8333889 C108.997403,14.2263569 116.663488,9.92727273 125.320028,9.92727273 C138.043441,9.92727273 148.627152,19.2146805 150.834755,31.4671412 C151.487388,31.3631046 152.156394,31.3090909 152.837838,31.3090909 C159.117096,31.3090909 164.340238,35.8953699 165.428708,41.9454545 Z"
+                                                                      class="slds-illustration__fill-secondary" fill-rule="nonzero"></path>
+                                                                <path vector-effect="non-scaling-stroke" d="M32.7065637,40.4454545 L173.706564,40.4454545" class="slds-illustration__stroke-secondary" stroke-width="3" stroke-linecap="round"></path>
+                                                            </g>
+                                                            <g transform="translate(33.000000, 128.000000)">
+                                                                <g transform="translate(106.000000, 0.000000)" fill="#FFFFFF" fill-rule="nonzero">
+                                                                    <polygon vector-effect="non-scaling-stroke" points="121.5 48.5 158.5 48.5 158.5 34.5 47.5 34.5 47.5 48.5 93.5 48.5 93.5 69.5 121.5 69.5"></polygon>
+                                                                    <path vector-effect="non-scaling-stroke" d="M33.9882812,0.21875 C36.5611979,0.21875 70.6126302,0.21875 136.142578,0.21875 L152.384766,11.1132813 C155.083088,16.811292 155.656656,19.677503 154.105469,19.7119141 C152.554281,19.7463252 116.293865,17.6717809 45.3242187,13.4882812 C35.1940104,4.64192708 31.4153646,0.21875 33.9882812,0.21875 Z"></path>
+                                                                    <path vector-effect="non-scaling-stroke" d="M32.6708984,2.02246094 L21.5554199,0.374195518 L17.6036034,0.374195518 L5.77148437,7.90429688 C3.09089817,12.6737672 3.09089817,15.2284547 5.77148437,15.5683594 C8.45207058,15.9082641 16.1278518,14.3268839 28.7988281,10.8242188 L42.9921875,7.90429688 L41.0699892,5.68448183 L32.6708984,2.02246094 Z"></path>
+                                                                    <rect x="0" y="34" width="48" height="14"></rect>
+                                                                </g>
+                                                                <g transform="translate(106.000000, 5.000000)" class="slds-illustration__fill-secondary" fill-rule="nonzero">
+                                                                    <polygon vector-effect="non-scaling-stroke" points="93.311 43.457 93.311 64.672 120.925 64.672 121.823 44.132 158.5 43.457 158.5 97.5 48.5 97.5 48.5 43.693"></polygon>
+                                                                    <path vector-effect="non-scaling-stroke" d="M132.670898,7.66300119e-19 C125.172201,-2.55433373e-19 94.1907552,-2.55433373e-19 39.7265625,7.66300119e-19 L31.8183594,12.5058594 L29.7050781,28.2714844 L157.78125,28.2714844 L157.78125,15.4775391 C148.539714,5.15917969 140.169596,1.78803361e-18 132.670898,7.66300119e-19 Z"></path>
+                                                                    <path vector-effect="non-scaling-stroke" d="M37.8266602,-3.55271368e-15 C34.4632704,-3.55271368e-15 29.4181858,-3.55271368e-15 22.6914062,-3.55271368e-15 C16.1624349,-3.55271368e-15 9.53808594,3.83528646 2.81835938,11.5058594 L0.705078125,30.2714844 L48.4101562,30.2714844 L48.4101562,14.4775391 L48.1789909,12.3275853 C43.283405,4.10919509 39.832628,-3.55271368e-15 37.8266602,-3.55271368e-15 Z"></path>
+                                                                    <rect x="0.5" y="43.5" width="48" height="54"></rect>
+                                                                </g>
+                                                                <rect class="slds-illustration__stroke-primary" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" x="154.5" y="34.5" width="110" height="68"></rect>
+                                                                <polygon vector-effect="non-scaling-stroke" class="slds-illustration__stroke-primary" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="264.5 48.5 264.5 34.5 154.5 34.5 154.5 48.5 199.5 48.5 199.5 69.5 227.5 69.5 227.5 48.5"></polygon>
+                                                                <path vector-effect="non-scaling-stroke" d="M130.5,0.5 L234.5,0.5 C251.068542,0.5 264.5,13.9314575 264.5,30.5 L264.5,34.5 L106.5,34.5 L106.5,24.5 C106.5,11.245166 117.245166,0.5 130.5,0.5 Z" class="slds-illustration__stroke-primary"
+                                                                      stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></path>
+                                                                <path vector-effect="non-scaling-stroke" d="M130.5,0.5 C143.754834,0.5 154.5,11.245166 154.5,24.5 L154.5,34.5 L106.5,34.5 L106.5,24.5 C106.5,11.245166 117.245166,0.5 130.5,0.5 Z" class="slds-illustration__stroke-primary" stroke-width="3"
+                                                                      stroke-linecap="round" stroke-linejoin="round"></path>
+                                                                <rect class="slds-illustration__stroke-primary" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" x="106.5" y="48.5" width="48" height="54"></rect>
+                                                                <rect class="slds-illustration__stroke-primary" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" x="106.5" y="34.5" width="48" height="14"></rect>
+                                                                <path vector-effect="non-scaling-stroke" d="M219,52 C219,54.765 216.765,57 214,57 C211.235,57 209,54.765 209,52 C209,49.235 211.235,47 214,47 C216.765,47 219,49.235 219,52 Z" class="slds-illustration__fill-primary" fill-rule="nonzero"></path>
+                                                                <path vector-effect="non-scaling-stroke" d="M214,55 L214,60" class="slds-illustration__stroke-primary" stroke-width="4" stroke-linecap="round"></path>
+                                                                <circle vector-effect="non-scaling-stroke" class="slds-illustration__fill-primary" fill-rule="nonzero" cx="164" cy="58" r="3"></circle>
+                                                                <circle vector-effect="non-scaling-stroke" class="slds-illustration__fill-primary" fill-rule="nonzero" cx="164" cy="93" r="3"></circle>
+                                                                <circle vector-effect="non-scaling-stroke" class="slds-illustration__fill-primary" fill-rule="nonzero" cx="255" cy="58" r="3"></circle>
+                                                                <circle vector-effect="non-scaling-stroke" class="slds-illustration__fill-primary" fill-rule="nonzero" cx="255" cy="93" r="3"></circle>
+                                                                <circle vector-effect="non-scaling-stroke" class="slds-illustration__fill-primary" fill-rule="nonzero" cx="145" cy="58" r="3"></circle>
+                                                                <circle vector-effect="non-scaling-stroke" class="slds-illustration__fill-primary" fill-rule="nonzero" cx="145" cy="93" r="3"></circle>
+                                                                <circle vector-effect="non-scaling-stroke" class="slds-illustration__fill-primary" fill-rule="nonzero" cx="116" cy="58" r="3"></circle>
+                                                                <circle vector-effect="non-scaling-stroke" class="slds-illustration__fill-primary" fill-rule="nonzero" cx="116" cy="93" r="3"></circle>
+                                                                <path vector-effect="non-scaling-stroke" d="M289.928751,82.2971422 L298,102.518658 L280,102.518658 L288.071249,82.2971422 C288.275982,81.784207 288.857768,81.5343604 289.370703,81.7390942 C289.625359,81.8407378 289.827108,82.0424867 289.928751,82.2971422 Z"
+                                                                      class="slds-illustration__fill-primary" fill-rule="nonzero"></path>
+                                                                <path vector-effect="non-scaling-stroke" d="M300.428751,89.8132712 L305.5,102.518658 L293.5,102.518658 L298.571249,89.8132712 C298.775982,89.300336 299.357768,89.0504894 299.870703,89.2552232 C300.125359,89.3568668 300.327108,89.5586158 300.428751,89.8132712 Z"
+                                                                      class="slds-illustration__fill-primary" fill-rule="nonzero"></path>
+                                                                <path vector-effect="non-scaling-stroke" d="M93.4287513,82.2971422 L101.5,102.518658 L83.5,102.518658 L91.5712487,82.2971422 C91.7759825,81.784207 92.3577681,81.5343604 92.8707033,81.7390942 C93.1253588,81.8407378 93.3271077,82.0424867 93.4287513,82.2971422 Z"
+                                                                      class="slds-illustration__fill-primary" fill-rule="nonzero" transform="translate(92.500000, 92.093119) scale(-1, 1) translate(-92.500000, -92.093119) "></path>
+                                                                <path vector-effect="non-scaling-stroke" d="M76.9287513,89.8132712 L82,102.518658 L70,102.518658 L75.0712487,89.8132712 C75.2759825,89.300336 75.8577681,89.0504894 76.3707033,89.2552232 C76.6253588,89.3568668 76.8271077,89.5586158 76.9287513,89.8132712 Z"
+                                                                      class="slds-illustration__fill-primary" fill-rule="nonzero" transform="translate(76.000000, 95.851183) scale(-1, 1) translate(-76.000000, -95.851183) "></path>
+                                                                <path vector-effect="non-scaling-stroke" d="M360,102.5 L372,102.5 M0,102.5 L350,102.5" class="slds-illustration__stroke-primary" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></path>
+                                                            </g>
+                                                            <g stroke-linecap="round" transform="translate(180.713492, 71.088189) rotate(-15.000000) translate(-180.713492, -71.088189) translate(153.713492, 52.588189)" class="slds-illustration__stroke-secondary" stroke-width="3">
+                                                                <path vector-effect="non-scaling-stroke" d="M31.03567,3.43547751 C31.03567,3.43547751 40.5798276,0.672084646 42.6484417,10.6910579" transform="translate(36.842056, 6.888632) rotate(41.000000) translate(-36.842056, -6.888632) "></path>
+                                                                <path vector-effect="non-scaling-stroke" d="M40.4282597,10.1797599 C40.4282597,10.1797599 49.9724173,7.41636703 52.0410314,17.4353402" transform="translate(46.234646, 13.632914) scale(-1, 1) rotate(-41.000000) translate(-46.234646, -13.632914) "></path>
+                                                                <path vector-effect="non-scaling-stroke" d="M0.730284783,29.5865514 C0.730284783,29.5865514 10.2744424,26.8231586 12.3430565,36.8421318"></path>
+                                                                <path vector-effect="non-scaling-stroke" d="M12.7299435,29.5865514 C12.7299435,29.5865514 22.2741011,26.8231586 24.3427152,36.8421318" transform="translate(18.536329, 33.039706) scale(-1, 1) translate(-18.536329, -33.039706) "></path>
+                                                            </g>
+                                                            <g transform="translate(258.000000, 0.000000)" class="slds-illustration__stroke-primary">
+                                                                <g stroke-width="3">
+                                                                    <path vector-effect="non-scaling-stroke" d="M67,120 C67,123.312 64.3135,126 61,126 C57.688,126 55,123.312 55,120 C55,116.688 57.688,114 61,114 C64.3135,114 67,116.688 67,120 Z" fill="#FFFFFF" fill-rule="nonzero"></path>
+                                                                    <path vector-effect="non-scaling-stroke" d="M52,135 C52,137.208 50.209,139 48,139 C45.792,139 44,137.208 44,135 C44,132.792 45.792,131 48,131 C50.209,131 52,132.792 52,135 Z"></path>
+                                                                    <path vector-effect="non-scaling-stroke" d="M96.0568799,0 C78.2900529,0 62.8190358,10.0568662 54.6662185,24.9225726 C49.0099109,20.7996522 42.1151387,18.3495864 34.6598756,18.3495864 C15.5126256,18.3495864 0,34.3231272 0,54.0272817 C0,73.7339036 15.5126256,89.7074443 34.6598756,89.7074443 C35.0735129,89.7074443 35.4822552,89.6556302 35.9007877,89.6408262 C42.1591947,98.9155466 52.5662134,105 64.3683403,105 C72.7414379,105 80.4243239,101.940502 86.4134995,96.8503854 C89.5292414,97.5116317 92.7551235,97.8644609 96.0568799,97.8644609 C122.314287,97.8644609 142,76.3690196 142,49.3467431 C142,22.3219992 122.314287,0 96.0568799,0 Z"
+                                                                          fill="#FFFFFF" fill-rule="nonzero" stroke-linecap="round" stroke-linejoin="round"></path>
+                                                                </g>
+                                                                <g transform="translate(75.999627, 52.000087) rotate(45.000000) translate(-75.999627, -52.000087) translate(59.999627, 16.000087)" stroke-width="6">
+                                                                    <circle vector-effect="non-scaling-stroke" cx="15" cy="6" r="6"></circle>
+                                                                    <circle vector-effect="non-scaling-stroke" cx="7" cy="18" r="7"></circle>
+                                                                    <circle vector-effect="non-scaling-stroke" cx="25" cy="18" r="7"></circle>
+                                                                    <path vector-effect="non-scaling-stroke" d="M15,24 L15,72 M12,34 L18,34 M15,55 L25,55 M15,65 L27,65" stroke-linecap="round"></path>
+                                                                </g>
+                                                            </g>
+                                                        </g>
+                                                    </g>
+                                                </svg>
+                                                <div class="slds-text-longform">
+                                                    <h3 class="slds-text-heading_medium">{!$Label.Pipeline_Not_Active_Error}</h3>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <footer class="slds-modal__footer">
+                                            <button class="slds-button slds-button_neutral" onClick="clearErrMessage(); closeWarningModal(); return false;">{!$Label.CLOSE}</button>
+                                            <button class="slds-button slds-button_brand" onClick="lockScreen(); activatePipeline(); return false;">{!$Label.ACTIVATE}</button>
+                                        </footer>
+                                    </div>
+                                </section>
+                                <div id="backdropActivationModal" class="slds-backdrop"></div>
+                            </div>
+                            <apex:actionFunction name="clearErrMessage" action="{!clearErrorMessage}" reRender="errorMessages" />
+                            <apex:actionFunction name="activatePipeline" action="{!activatePipeline}" onComplete="closeWarningModal();unlockScreen();" reRender="copadoErrorPanel,pageMsgs" />
+                            <apex:outputPanel id="errorResult">
+                                <script>
+                                    function checkErrorResult() {
+                                        var returnErrorMessage = $copado('[Id$=theErrorMessage]');
+                                        if(!returnErrorMessage || returnErrorMessage.text() === "") {
+                                            closeWarningModal();
+                                        }
+                                        unlockScreen();
+                                        return false;
+                                    }
+
+                                </script>
+                            </apex:outputPanel>
+                            <div class="slds-page-header__row">
+                                <div class="slds-page-header__col-title">
+                                    <div class="slds-media">
+                                        <div class="slds-media__figure">
+                                            <apex:image value="{!URLFOR($Resource.copado__DTS_images, 'app_icon.png')}" />
+                                        </div>
+                                        <div class="slds-media__body">
+                                            <div class="slds-page-header__name">
+                                                <div class="slds-page-header__name-title">
+                                                    <h1>
+                                                        <span>{!IF(pipelineMode == MANAGER, $ObjectType.copado__Deployment_Flow__c.Label, $Label.copado__pipeline_configuration)}</span>
+                                                        <span class="slds-page-header__title">
+                                                            <apex:selectList value="{!currentPipeline.Id}" id="pipelinePicklist" size="1" multiselect="false" styleClass="slds-select pipeline-picklist" onChange="updatePipelinePanel();">
+                                                                <apex:selectOptions value="{!allPipelines}" />
+                                                            </apex:selectList>
+                                                        </span>
+                                                    </h1>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="slds-page-header__col-actions">
+                                    <div class="slds-page-header__controls">
+                                        <div class="slds-page-header__control buttons">
+                                            <div class="slds-button-group" role="group">
+                                                <apex:outputPanel layout="none" rendered="{!pipelineMode == MANAGER}">
+                                                    <apex:commandButton onClick="openRebaseModal(); return false;" value="{!$Label.copado__mass_back_promote}" reRender="headerPanel,filterWrapper" styleClass="slds-button slds-button_neutral" />
+                                                    <apex:commandButton onClick="togglePipelineMode(); return false;" styleClass="slds-button slds-button_brand" value="{!IF(pipelineMode == DIAGRAM, $Label.copado__view_pipeline, $Label.copado__view_pipeline_setup)}" reRender="pipelineWrapper, filterManagerPanel"></apex:commandButton>
+                                                </apex:outputPanel>
+                                                <apex:outputPanel layout="none" rendered="{!pipelineMode == DIAGRAM}">
+                                                    <apex:commandButton onClick="togglePipelineMode(); return false;" styleClass="slds-button slds-button_brand toggle-pipeline" value="{!IF(pipelineMode == DIAGRAM, $Label.copado__view_pipeline, $Label.copado__view_pipeline_setup)}" reRender="pipelineWrapper, filterManagerPanel"></apex:commandButton>
+                                                    <div class="slds-dropdown-trigger slds-dropdown-trigger_click slds-button_last diagramDropwdown">
+                                                        <button class="slds-button slds-button_icon slds-button_icon-border-filled slds-button_icon-x-small diagramActionButton" aria-haspopup="true" title="Show More" type="button">▾
+                                                            <span class="slds-assistive-text">Show More</span>
+                                                        </button>
+                                                        <div class="slds-dropdown slds-dropdown_right slds-dropdown_actions actions">
+                                                            <ul class="slds-dropdown__list" role="menu">
+                                                                <li class="slds-dropdown__item" role="presentation">
+                                                                    <a href="javascript:void(0);" role="menuitem" tabindex="0">
+                                                                        <apex:commandLink onClick="lockScreen();showVarModal();" value="{!$Label.copado__variables}" reRender="headerPanel,filterWrapper" styleClass="slds-button" style="margin-top: -15px;" /> <!-- margin top is for a on top -->
+                                                                    </a>
+                                                                </li>
+                                                                <li class="slds-dropdown__item" role="presentation">
+                                                                    <a href="/{!currentPipeline.Id}" role="menuitem" tabindex="-1" class="slds-button">
+                                                                        <span class="slds-truncate" title="{!$Label.VIEW_PIPELINE_RECORD}">{!$Label.VIEW_PIPELINE_RECORD}</span>
+                                                                    </a>
+                                                                </li>
+                                                            </ul>
+                                                        </div>
+                                                    </div>
+                                                </apex:outputPanel>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <!--Cards-->
+                        <div id="pipelineContainer" class="slds-tabs_default slds-tabs_card slds-m-top_medium bundle-tabs slds-tabs_medium slds-grid slds-grid_vertical slds-grow example-selected">
+                            <div id="svgContainer"></div>
+                            <div class="wrapper">
+                                <apex:outputPanel layout="block" styleClass="form-wrapper" id="filterManagerPanel">
+                                    <div class="filter-main-object">
+                                        <div class="slds-grid slds-grid_align-end slds-m-around_x-small filter-wrapper">
+                                            <div class="slds-col slds-p-right_small slds-text-body_regular slds-align-middle">
+                                                <apex:outputPanel layout="none" rendered="{!pipelineMode == MANAGER}">
+                                                <apex:commandLink action="{!recalculate}" reRender="pipelineWrapper" onComplete="ccd.reRenderFunction();" status="loadingScreen">
+                                                        <img class="connection" src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-reload.png')}" /> {!$Label.Refresh_Pipeline}
+                                                </apex:commandLink>
+                                                </apex:outputPanel>
+                                            </div>
+                                            <div class="slds-col slds-p-right_small slds-text-body_regular slds-align-middle">
+                                                <b>{!$Label.copado__view}:</b>
+                                            </div>
+                                            <div class="slds-col slds-p-right_small slds-size_small">
+                                                <apex:selectList multiSelect="false" size="1" value="{!selectedFilterId}" styleClass="slds-select filterDropdown">
+                                                    <apex:selectOptions value="{!filterOptions}" />
+                                                    <apex:actionSupport event="onchange" action="{!applySelectedFilter}" reRender="filterModalForm,filterManagerPanel,calculatedStepsPanel,flowStepPanel,pageMsgs"
+                                                                        status="loadingScreen" onComplete="updatePageGraphics();" />
+                                                </apex:selectList>
+                                            </div>
+                                            <div class="slds-col">
+                                                <div class="slds-dropdown-trigger slds-dropdown-trigger_click more-options filterOptionsMenu">
+                                                    <button class="slds-button slds-button_icon slds-button_icon-border-filled" aria-haspopup="true"
+                                                            title="More Options" onclick="return false;" id="filterSettings">
+                                                        <span>
+                                                            <img src="{!URLFOR($Resource.SLDS, '/assets/icons/utility/settings_60.png')}" class="settings" />
+                                                        </span>
+                                                        <span>
+                                                            <img src="{!URLFOR($Resource.SLDS, '/assets/icons/utility/down_60.png')}" class="down-arrow" />
+                                                        </span>
+                                                    </button>
+                                                    <div class="slds-dropdown slds-dropdown_right filterSettingsMenu">
+                                                        <ul class="slds-dropdown__list" role="menu" aria-label="Show More">
+                                                            <li class="slds-dropdown__header slds-truncate" title="{!$Label.Pipeline_View_Controls}" role="separator">
+                                                                <span class="slds-text-title_caps">{!$Label.Pipeline_View_Controls}</span>
+                                                            </li>
+                                                            <li class="slds-has-divider_top-space" role="separator"></li>
+                                                            <li class="slds-dropdown__item" role="presentation">
+                                                                <a href="javascript:void(0);" role="menuitem" tabindex="0" onclick="showFilterModal(true);"
+                                                                   aria-disabled="{!selectedFilterId != null}">
+                                                                    <span class="slds-truncate" title="{!$Label.NEW}">{!$Label.NEW}</span>
+                                                                </a>
+                                                            </li>
+                                                            <li class="slds-dropdown__item" role="presentation">
+                                                                <a href="javascript:void(0);" role="menuitem" tabindex="0" onclick="showFilterModal(true);"
+                                                                   aria-disabled="{!selectedFilterId == null}">
+                                                                    <span class="slds-truncate" title="{!$Label.EDIT}">{!$Label.EDIT}</span>
+                                                                </a>
+                                                            </li>
+                                                            <li class="slds-dropdown__item" role="presentation">
+                                                                <a href="javascript:void(0);" role="menuitem" tabindex="-1" onclick="showConfirmFilterDeletion(true);"
+                                                                   aria-disabled="{!selectedFilterId == null}">
+                                                                    <span class="slds-truncate" title="{!$Label.DELETE}">{!$Label.DELETE}</span>
+                                                                </a>
+                                                            </li>
+                                                        </ul>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </apex:outputPanel>
+                                <div id="minimap"><div id="minimapHeader" class="minimap-header" title="{!$Label.Move_Minimap}">&#x2725;</div></div>
+                                <div class="pipeline">
+                                    <apex:repeat value="{!allEnvironmentsByStageGroupMap}" var="envByStage">
+                                        <div class="column">
+                                            <apex:repeat value="{!allEnvironmentsByStageGroupMap[envByStage]}" var="envByGroup">
+                                                <apex:outputPanel layout="none">
+                                                    <apex:repeat value="{!allEnvironmentsByStageGroupMap[envByStage][envByGroup]}" var="envWrapper">
+                                                        <div class="box-container {!CASE(pipelineMode, "manager", "manager", "diagram", "diagram", "")}" id="wrapper_{!IF(envByGroup != 'Final', envWrapper.environmentIdentifier, IF(envWrapper.currentStep.Destination_Environment__c != null, envWrapper.currentStep.Destination_Environment__c, envWrapper.currentStep.Destination_Branch__c))}" data-flowstepid="{!envWrapper.currentStep.Id}" data-floaters="" data-branch="{!envWrapper.currentStep.Branch__c}">
+                                                            <apex:outputPanel layout="none" rendered="{!AND(envByGroup != 'Final', OR(AND(pipelineMode == DIAGRAM, envWrapper.currentStep.Connection_Behavior_Override__c != null), pipelineMode == MANAGER))}">
+                                                                <div class="connection-info">
+                                                                    <div class="{!CASE(pipelineMode, "manager", "commits", "diagram", "connection-behaviour-override", "")} show">
+                                                                        <apex:outputPanel layout="none" rendered="{!AND(pipelineMode == MANAGER, envByGroup != 'Final')}">
+                                                                            <div class="icon storyCountAhead {!IF(envWrapper.userStoriesAhead== 0, 'disabled', '')}">
+                                                                                <div class="button-wrapper">
+                                                                                    <button type="button" class="storyCountAheadBtn" onclick="lockScreen();prepareUserStoriesForPromotion('{!envWrapper.currentEnvironment.Id}','{!envWrapper.currentStep.Destination_Environment__c}','merge')">{!envWrapper.userStoriesAhead}</button>
+                                                                                </div>
+                                                                                <div class="image-wrapper">
+                                                                                    <img src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-right-arrow.png')}" title="{!$Label.Pipeline_Promote}" />
+                                                                                </div>
+                                                                            </div>
+                                                                            <div class="icon storyCountBehind {!IF(envWrapper.userStoriesBehind == 0, 'disabled', '')}">
+                                                                                <div class="button-wrapper">
+                                                                                    <button type="button" class="storyCountBehindBtn" onclick="lockScreen();prepareUserStoriesForPromotion('{!envWrapper.currentStep.Destination_Environment__c}','{!envWrapper.currentEnvironment.Id}','pull')">{!envWrapper.userStoriesBehind}</button>
+                                                                                </div>
+                                                                                <div class="image-wrapper">
+                                                                                    <img src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-left-arrow.png')}" title="{!$Label.Pipeline_Back_Promote}" />
+                                                                                </div>
+                                                                            </div>
+                                                                        </apex:outputPanel>
+                                                                        <apex:outputPanel layout="none" rendered="{!AND(pipelineMode == DIAGRAM, envWrapper.currentStep.Connection_Behavior_Override__c != null)}" style="cursor: pointer;">
+                                                                            <div class="minipagelayout" style="opacity: 0;position:fixed;">
+                                                                                <apex:outputField value="{!envWrapper.currentStep.Connection_Behavior_Override__c}" />
+                                                                            </div>
+                                                                            <div class="icon">
+                                                                                <div class="image-wrapper ">
+                                                                                    <apex:outputPanel layout="none" rendered="{!envWrapper.currentStep.Connection_Behavior_Override__r.Promotion_Behavior__c == 'Automated'}">
+                                                                                        <a href="/{!envWrapper.currentStep.Connection_Behavior_Override__c}" target="_blank">
+                                                                                            <img class="connection" src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-infinity.png')}" />
+                                                                                        </a>
+                                                                                    </apex:outputPanel>
+                                                                                    <apex:outputPanel layout="none" rendered="{!envWrapper.currentStep.Connection_Behavior_Override__r.Promotion_Behavior__c == 'Scheduled'}">
+                                                                                        <a href="/{!envWrapper.currentStep.Connection_Behavior_Override__c}" target="_blank">
+                                                                                            <img class="connection" src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-clock.png')}" /></a>
+                                                                                    </apex:outputPanel>
+                                                                                    <apex:outputPanel layout="none" rendered="{!envWrapper.currentStep.Connection_Behavior_Override__r.Promotion_Behavior__c == 'Manual'}">
+                                                                                        <a href="/{!envWrapper.currentStep.Connection_Behavior_Override__c}" target="_blank">
+                                                                                            <img class="connection" src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-right-point-hand.png')}" /></a>
+                                                                                    </apex:outputPanel>
+                                                                                </div>
+                                                                                <div class="image-wrapper-2">
+                                                                                    <apex:image url="{!URLFOR($Resource.copado__SetupDashboardIcons, 'PipelineSvgIcons/pipeline-right-arrow-blue.png')}" styleClass="connection" rendered="{!envWrapper.currentStep.Connection_Behavior_Override__r.Promotion_Behavior__c != null}" />
+                                                                                </div>
+                                                                            </div>
+                                                                            <div class="icon">
+                                                                                <div class="image-wrapper">
+                                                                                    <a href="/{!envWrapper.currentStep.Connection_Behavior_Override__c}" target="_blank">
+                                                                                        <img class="connection" src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-shield.png')}" /></a>
+                                                                                </div>
+                                                                            </div>
+                                                                            <div class="icon">
+                                                                                <div class="image-wrapper">
+                                                                                    <apex:outputPanel layout="none" rendered="{!envWrapper.currentStep.Connection_Behavior_Override__r.Back_Promotion_Behavior__c == 'Automated'}">
+                                                                                        <a href="/{!envWrapper.currentStep.Connection_Behavior_Override__c}" target="_blank">
+                                                                                            <img class="connection" src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-infinity.png')}" /></a>
+                                                                                    </apex:outputPanel>
+                                                                                    <apex:outputPanel layout="none" rendered="{!envWrapper.currentStep.Connection_Behavior_Override__r.Back_Promotion_Behavior__c == 'Scheduled'}">
+                                                                                        <a href="/{!envWrapper.currentStep.Connection_Behavior_Override__c}" target="_blank">
+                                                                                            <img class="connection" src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-clock.png')}" /></a>
+                                                                                    </apex:outputPanel>
+                                                                                    <apex:outputPanel layout="none" rendered="{!envWrapper.currentStep.Connection_Behavior_Override__r.Back_Promotion_Behavior__c == 'Manual'}">
+                                                                                        <a href="/{!envWrapper.currentStep.Connection_Behavior_Override__c}" target="_blank">
+                                                                                            <img class="connection" src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-left-point-hand.png')}" /></a>
+                                                                                    </apex:outputPanel>
+                                                                                </div>
+                                                                                <div class="image-wrapper-2">
+                                                                                    <apex:image url="{!URLFOR($Resource.copado__SetupDashboardIcons, 'PipelineSvgIcons/pipeline-left-arrow-blue.png')}" styleClass="connection" rendered="{!envWrapper.currentStep.Connection_Behavior_Override__r.Back_Promotion_Behavior__c != null}" />
+                                                                                </div>
+                                                                            </div>
+                                                                        </apex:outputPanel>
+                                                                    </div>
+                                                                </div>
+                                                            </apex:outputPanel>
+                                                            <apex:outputPanel rendered="{!AND(envByGroup != 'Final', pipelineMode == DIAGRAM, envWrapper.currentStep.Connection_Behavior_Override__c == null)}">
+                                                            <div class="connection-info" onmouseover="ccd.toggleNewConnectionIcon(this); return true;" onmouseout="ccd.toggleNewConnectionIcon(this); return true;">
+                                                                    <div class="{!CASE(pipelineMode, "manager", "commits", "diagram", "connection-behaviour-override", "")} hide">
+                                                                        <div>
+                                                                            <div onclick="lockScreen();createNewConnectionBehaviorAndBind('{!envWrapper.currentStep.Id}', '', '{!JSINHTMLENCODE(IF(envWrapper.currentStep.Source_Environment__r.Name != null, envWrapper.currentStep.Source_Environment__r.Name, envWrapper.currentStep.Branch__c))}', '{!JSINHTMLENCODE(IF(envWrapper.currentStep.Destination_Environment__r.Name != null, envWrapper.currentStep.Destination_Environment__r.Name, envWrapper.currentStep.Destination_Branch__c))}');">
+                                                                                <img class="new" src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/new-connection.png')}" title="Create new connection" />
+                                                                            </div>
+                                                                        </div>
+                                                                    </div>
+                                                                </div>
+                                                            </apex:outputPanel>
+                                                            <apex:outputPanel rendered="{!pipelineMode == DIAGRAM}">
+                                                                <div class="create-env-btn">
+                                                                    <apex:outputPanel rendered="{!envWrapper.currentEnvironment.Id == NULL}" layout="none">
+                                                                        <input type="button" onclick="ccd.createOrg('{!envWrapper.currentStep.Id}', '{!envWrapper.currentEnvironment.Id}', '{!JSINHTMLENCODE(envWrapper.currentEnvironment.Name)}', false);" data-branch="undefined" data-parentselector="box_undefined" class="noCreateEnv" value="+" title="{!$Label.Pipeline_Environment_Setup_Should_Be_Complete}" disabled="true" />
+                                                                    </apex:outputPanel>
+                                                                    <apex:outputPanel rendered="{!envWrapper.currentEnvironment.Id != NULL}" layout="none">
+                                                                        <input type="button" onclick="ccd.createOrg('{!envWrapper.currentStep.Id}', '{!envWrapper.currentEnvironment.Id}', '{!JSINHTMLENCODE(envWrapper.currentEnvironment.Name)}', false);" data-branch="undefined" data-parentselector="box_undefined" class="createEnv" value="+" title="{!$Label.Create_new_Environment_Connection}" />
+                                                                    </apex:outputPanel>
+
+                                                                </div>
+                                                            </apex:outputPanel>
+                                                            <div id="box_{!envWrapper.currentEnvironment.Id}" data-branch="{!envWrapper.currentStep.Branch__c}" data-boxid="{!envWrapper.currentStep.Id}" class="env-box">
+                                                                <div class="slds-no-flex">
+                                                                    <apex:outputPanel rendered="{!pipelineMode == DIAGRAM}">
+                                                                        <div class="slds-dropdown-trigger slds-dropdown-trigger_click envActionMenuTrigger">
+                                                                            <button class="slds-button slds-button_icon slds-button_icon-border-filled slds-button_icon-x-small envActionButton" aria-haspopup="true" title="Show More" onclick="ccd.openDropdownMenu(this);" type="button">▾
+                                                                                <span class="slds-assistive-text">Show More</span>
+                                                                            </button>
+                                                                        </div>
+                                                                    </apex:outputPanel>
+                                                                </div>
+                                                                <div class="info">
+                                                                    <apex:outputPanel layout="none" rendered="{!pipelineMode == MANAGER}">
+                                                                        <div class='status'>
+                                                                            <div class='button-wrapper'>
+                                                                                <a href="javascript:void(0)" onclick="showDeploymentModal('{!envWrapper.currentEnvironment.Id}');" aria-disabled="{!IF(envWrapper.currentEnvironment.Latest_Deployment_Status__c == null, 'true', 'false')}">
+                                                                                    <apex:outputPanel layout="none" rendered="{!envWrapper.currentEnvironment.Latest_Deployment__r.Paused__c != true}">
+                                                                                        <apex:outputPanel rendered="{!envWrapper.currentEnvironment.Latest_Deployment_Status__c == 'Completed Successfully'}">
+                                                                                            <img id="deploymentStatus_{!envWrapper.currentEnvironment.Id}" src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-check.png')}" />
+                                                                                        </apex:outputPanel>
+                                                                                        <apex:outputPanel rendered="{!envWrapper.currentEnvironment.Latest_Deployment_Status__c == 'Completed with Errors'}">
+                                                                                            <img id="deploymentStatus_{!envWrapper.currentEnvironment.Id}" src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-cross.png')}" />
+                                                                                        </apex:outputPanel>
+                                                                                        <apex:outputPanel rendered="{!envWrapper.currentEnvironment.Latest_Deployment_Status__c == 'Merge Conflict'}">
+                                                                                            <img id="deploymentStatus_{!envWrapper.currentEnvironment.Id}" src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-warning.png')}" />
+                                                                                        </apex:outputPanel>
+                                                                                        <apex:outputPanel rendered="{!envWrapper.currentEnvironment.Latest_Deployment_Status__c == 'In progress'}">
+                                                                                            <div id="deploymentStatus_{!envWrapper.currentEnvironment.Id}" class='spinner'>
+                                                                                                <div role='status' class='slds-spinner slds-spinner_xx-small slds-spinner_brand'>
+                                                                                                    <span class='slds-assistive-text'>Loading</span>
+                                                                                                    <div class='slds-spinner__dot-a'></div>
+                                                                                                    <div class='slds-spinner__dot-b'></div>
+                                                                                                </div>
+                                                                                            </div>
+                                                                                        </apex:outputPanel>
+                                                                                        <apex:outputPanel rendered="{!AND(envWrapper.currentEnvironment.Latest_Deployment__c == null, envWrapper.currentEnvironment.Latest_Deployment_Status__c == NULL)}">
+                                                                                            <img id="noDeploymentStatus_{!envWrapper.currentEnvironment.Id}" src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-no-status.png')}" />
+                                                                                        </apex:outputPanel>
+                                                                                    </apex:outputPanel>
+                                                                                    <apex:outputPanel layout="none" rendered="{!envWrapper.currentEnvironment.Latest_Deployment__r.Paused__c == true}">
+                                                                                        <img id="deploymentStatus_{!envWrapper.currentEnvironment.Id}" src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-paused.png')}" />
+                                                                                    </apex:outputPanel>
+                                                                                </a>
+                                                                            </div>
+                                                                        </div>
+                                                                    </apex:outputPanel>
+                                                                    <div class="data">
+                                                                        <span id="{!envWrapper.currentEnvironment.Id}_title" class="org" target="_blank" title="{!envWrapper.currentEnvironment.Name}">{!envWrapper.currentEnvironment.Name}</span><br />
+                                                                        <apex:outputPanel rendered="{!envByGroup != 'Final'}">
+                                                                            <div class="branch" title="{!envWrapper.currentStep.Branch__c}">Branch
+                                                                                <span>{!envWrapper.currentStep.Branch__c}</span></div>
+                                                                        </apex:outputPanel>
+                                                                        <apex:outputPanel rendered="{!envByGroup == 'Final'}">
+                                                                            <div class="branch" title="{!envWrapper.currentStep.Destination_Branch__c}">Branch
+                                                                                <span>{!envWrapper.currentStep.Destination_Branch__c}</span></div>
+                                                                        </apex:outputPanel>
+                                                                    </div>
+                                                                </div>
+                                                                <div>
+                                                                    <apex:outputPanel rendered="{!pipelineMode == DIAGRAM}" layout="none">
+                                                                        <hr style="width: 90%;margin: 0 auto;" />
+                                                                        <apex:outputPanel layout="none" rendered="{!AND(envWrapper.currentEnvironment.Connection_Behavior__c != null, envWrapper.isDestinationEnv)}">
+                                                                            <div class="env-connection-info">
+                                                                                <div class="env-connection-behaviour-override">
+                                                                                    <div class="minipagelayout" style="opacity: 0;position:fixed;">
+                                                                                        <apex:outputField value="{!envWrapper.currentEnvironment.Connection_Behavior__c}" />
+                                                                                    </div>
+                                                                                    <div class="icon">
+                                                                                        <div style="height:11px;">
+                                                                                            <apex:outputPanel rendered="{!envWrapper.currentEnvironment.Connection_Behavior__r.Promotion_Behavior__c == 'Automated'}">
+                                                                                                <img src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-infinity.png')}" />
+                                                                                            </apex:outputPanel>
+                                                                                            <apex:outputPanel rendered="{!envWrapper.currentEnvironment.Connection_Behavior__r.Promotion_Behavior__c == 'Scheduled'}">
+                                                                                                <img src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-clock.png')}" />
+                                                                                            </apex:outputPanel>
+                                                                                            <apex:outputPanel rendered="{!envWrapper.currentEnvironment.Connection_Behavior__r.Promotion_Behavior__c == 'Manual'}">
+                                                                                                <img src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-right-point-hand.png')}" />
+                                                                                            </apex:outputPanel>
+                                                                                        </div>
+                                                                                        <div>
+                                                                                            <img src="{!URLFOR($Resource.copado__SetupDashboardIcons, 'PipelineSvgIcons/pipeline-right-arrow-blue.png')}" />
+                                                                                        </div>
+                                                                                    </div>
+                                                                                    <div class="icon">
+                                                                                        <div style="height:11px;">
+                                                                                            <img src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-shield.png')}" />
+                                                                                        </div>
+                                                                                    </div>
+                                                                                    <div class="icon">
+                                                                                        <div style="height:11px;">
+                                                                                            <apex:outputPanel rendered="{!envWrapper.currentEnvironment.Connection_Behavior__r.Back_Promotion_Behavior__c == 'Automated'}">
+                                                                                                <img src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-infinity.png')}" />
+                                                                                            </apex:outputPanel>
+                                                                                            <apex:outputPanel rendered="{!envWrapper.currentEnvironment.Connection_Behavior__r.Back_Promotion_Behavior__c == 'Scheduled'}">
+                                                                                                <img src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-clock.png')}" />
+                                                                                            </apex:outputPanel>
+                                                                                            <apex:outputPanel rendered="{!envWrapper.currentEnvironment.Connection_Behavior__r.Back_Promotion_Behavior__c == 'Manual'}">
+                                                                                                <img src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-left-point-hand.png')}" />
+                                                                                            </apex:outputPanel>
+                                                                                        </div>
+                                                                                        <div>
+                                                                                            <img src="{!URLFOR($Resource.copado__SetupDashboardIcons, 'PipelineSvgIcons/pipeline-left-arrow-blue.png')}" />
+                                                                                        </div>
+                                                                                    </div>
+                                                                                </div>
+                                                                            </div>
+                                                                        </apex:outputPanel>
+                                                                        <apex:outputPanel layout="none" rendered="{!AND(envWrapper.currentEnvironment.Connection_Behavior__c == null, envWrapper.currentEnvironment.Id != null, envWrapper.isDestinationEnv)}">
+                                                                            <div class="env-connection-info" onclick="lockScreen();createNewConnectionBehaviorAndBind('','{!envWrapper.currentEnvironment.Id}', '{!JSINHTMLENCODE(envWrapper.currentEnvironment.Name)}','');">
+                                                                                <div title="Click here to create a connection behavior" class="env-connection-behaviour-override" style="filter: grayscale(100%);opacity:60%;">
+                                                                                    <div class="icon">
+                                                                                        <div style="height:11px;">
+                                                                                            <img src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-right-point-hand.png')}" style="filter: grayscale(100%);" />
+                                                                                        </div>
+                                                                                        <div>
+                                                                                            <img src="{!URLFOR($Resource.copado__SetupDashboardIcons, 'PipelineSvgIcons/pipeline-right-arrow-blue.png')}" />
+                                                                                        </div>
+                                                                                    </div>
+                                                                                    <div class="icon">
+                                                                                        <div style="height:11px;">
+                                                                                            <img src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-shield.png')}" style="filter: grayscale(100%);" />
+                                                                                        </div>
+                                                                                    </div>
+                                                                                    <div class="icon">
+                                                                                        <div style="height:11px;">
+                                                                                            <img src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-left-point-hand.png')}" style="filter: grayscale(100%);" />
+                                                                                        </div>
+                                                                                        <div>
+                                                                                            <img src="{!URLFOR($Resource.copado__SetupDashboardIcons, 'PipelineSvgIcons/pipeline-left-arrow-blue.png')}" />
+                                                                                        </div>
+                                                                                    </div>
+                                                                                </div>
+                                                                            </div>
+                                                                        </apex:outputPanel>
+                                                                    </apex:outputPanel>
+                                                                    <div class="authenticate-icon" style="{!IF(CONTAINS($User.UIThemeDisplayed, 'Theme4'), '', 'margin-top:-15px;')}">
+                                                                        <apex:outputPanel layout="none" rendered="{!AND(envWrapper.needsOauth, pipelineMode == DIAGRAM)}">
+                                                                            <div onclick="doOauth('{!envWrapper.currentStep.Id}','{!envWrapper.currentEnvironment.Id}', '{!JSINHTMLENCODE(envWrapper.currentEnvironment.Name)}', '{!JSINHTMLENCODE(envWrapper.currentStep.Branch__c)}');">
+                                                                                <apex:commandButton title="{!$Label.copado__add_oauth}" styleClass="btn slds-button" style="color:#3593c6;" status="loadingScreen">
+                                                                                    <img src="{!URLFOR($Resource.SetupDashboardIcons, 'PipelineSvgIcons/pipeline-authenticate.png')}" />
+                                                                                </apex:commandButton>
+                                                                            </div>
+                                                                        </apex:outputPanel>
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                            <div class="slds-dropdown slds-dropdown_left slds-dropdown_length-2 slds-dropdown_x-small slds-hide envActionDropdown">
+                                                                <ul class="slds-dropdown__list" role="menu">
+                                                                    <li class="slds-dropdown__item" role="presentation">
+                                                                        <a href="/{!envWrapper.currentEnvironment.Id}" role="menuitem" target="_blank" aria-disabled="{!IF(envWrapper.currentEnvironment.Id == null, true, false)}">
+                                                                            <span class="slds-truncate" title="{!$Label.EDIT_ENVIRONMENT}">{!$Label.EDIT_ENVIRONMENT}</span>
+                                                                        </a>
+                                                                    </li>
+                                                                    <apex:outputPanel layout="none" rendered="{!envWrapper.currentEnvironment.Connection_Behavior__c != null}">
+                                                                        <li class="slds-dropdown__item" role="presentation">
+                                                                            <a href="#" role="menuitem" onclick="lockScreen();cloneConnectionBehaviorBasedonObjectSent('{!envWrapper.currentEnvironment.Id}');">
+                                                                                <span class="slds-truncate" title="{!$Label.Detach_Behavior_of_Incoming_Connections}">{!$Label.Detach_Behavior_of_Incoming_Connections}</span>
+                                                                            </a>
+                                                                        </li>
+                                                                    </apex:outputPanel>
+                                                                    <apex:outputPanel layout="none" rendered="{!envWrapper.currentStep.Connection_Behavior_Override__c != null}">
+                                                                        <li class="slds-dropdown__item" role="presentation">
+                                                                            <a href="#" role="menuitem" onclick="lockScreen();cloneConnectionBehaviorBasedonObjectSent('{!envWrapper.currentStep.Id}');">
+                                                                                <span class="slds-truncate" title="{!$Label.Detach_Behavior_of_Outgoing_Connection}">{!$Label.Detach_Behavior_of_Outgoing_Connection}</span>
+                                                                            </a>
+                                                                        </li>
+                                                                    </apex:outputPanel>
+                                                                </ul>
+                                                            </div>
+                                                        </div>
+                                                    </apex:repeat>
+                                                </apex:outputPanel>
+                                            </apex:repeat>
+                                        </div>
+                                    </apex:repeat>
+                                    <apex:actionFunction name="cloneConnectionBehaviorBasedonObjectSent" action="{!deepCloneRelatedConnectionBehavior}" reRender="pipelineWrapper" onComplete="ccd.reRenderFunction();unlockScreen();">
+                                        <apex:param name="recordId" value="" />
+                                    </apex:actionFunction>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </apex:outputPanel>
+                <apex:outputPanel id="calculatedStepsPanel">
+                    <apex:inputHidden value="{!allEnvironmentsByStageGroupMapJson}" id="allEnvJSONMap" />
+                    <script>
+                        function repositionBoxes() {
+                            ccd.data.connections = $copado('[id$="allEnvJSONMap"]').val();
+                        }
+                        function updateStoryStreamVariables() {
+                            var streamingSettingsMap = JSON.parse('{!JSENCODE(streamingSettingsJSON)}');
+                            var storyStreamSettings = streamingSettingsMap[ccdStoryStream.config.pushTopicName];
+                            if(storyStreamSettings && storyStreamSettings[copadoApp.ns + 'Enabled__c']) {
+                                ccdStoryStream.params.pipelineId = '{!currentPipeline.Id}';
+                                ccdStoryStream.params.sourceIds = JSON.parse('{!JSENCODE(allSourceIdsJSON)}');
+                                ccdStoryStream.params.destinationIds = JSON.parse('{!JSENCODE(allDestinationIdsJSON)}');
+                                ccdStoryStream.params.filterJSON = '{!JSENCODE(selectedFilterJSON)}';
+                                ccdStoryStream.params.flowStepToEnvJSON = '{!JSENCODE(flowStepToEnvironmentJSON)}';
+                                ccdStoryStream.params.allEnvironmentKeyJSON = '{!JSENCODE(allEnvironmentsKeysetJSON)}';
+                                ccdStoryStream.params.allEnvironmentToStageJSON = '{!JSENCODE(allEnvironmentsToStageGroupKeysetJSON)}';
+                            }
+                        }
+
+                    </script>
+                </apex:outputPanel>
+            </apex:outputPanel>
+        </apex:form>
+        <apex:include pageName="copado__PipelineManagerDialog" />
+        <apex:include pageName="copado__PipelinePromotion" />
+    </div>
+</apex:page>
